@@ -11,6 +11,7 @@ use reth_rpc_eth_api::{
     helpers::{EthBlocks, LoadBlock, LoadPendingBlock, LoadReceipt, SpawnBlocking},
     RpcNodeCore, RpcReceipt,
 };
+use revm::L1BlockInfo;
 
 use crate::{OpEthApi, OpEthApiError, OpReceiptBuilder};
 
