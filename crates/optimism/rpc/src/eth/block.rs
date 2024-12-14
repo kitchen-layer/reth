@@ -42,8 +42,8 @@ where
             //    reth_optimism_evm::extract_l1_info(&block.body).map_err(OpEthApiError::from)?;
             let l1_block_info = L1BlockInfo {
                 l1_base_fee: U256::from(1055991687),
-                l1_fee_overhead: U256::from(4471),
-                l1_base_fee_scalar: U256::from(5227),
+                l1_fee_overhead: Some(U256::from(4471)),
+                l1_base_fee_scalar: Some(U256::from(5227)),
                 l1_blob_base_fee: None,
                 l1_blob_base_fee_scalar: None,
             };
