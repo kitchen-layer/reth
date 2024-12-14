@@ -1,6 +1,7 @@
 //! Loads and formats OP block RPC response.
 
 use alloy_rpc_types_eth::BlockId;
+use alloy_primitives::U256;
 use op_alloy_network::Network;
 use op_alloy_rpc_types::OpTransactionReceipt;
 use reth_chainspec::ChainSpecProvider;
