@@ -1,5 +1,5 @@
 //! Loads and formats OP block RPC response.
-
+use alloy_primitives::U256;
 use alloy_rpc_types_eth::BlockId;
 use op_alloy_network::Network;
 use op_alloy_rpc_types::OpTransactionReceipt;
@@ -39,7 +39,8 @@ where
 
             //let l1_block_info =
             //    reth_optimism_evm::extract_l1_info(&block.body).map_err(OpEthApiError::from)?;
-            let l1_block_info = L1BlockInfo::default();
+            let mut l1_block_info = L1BlockInfo::default();
+            l1_block_info.l1_base_fee = U256::from(1055991687);
 
             return block
                 .body
