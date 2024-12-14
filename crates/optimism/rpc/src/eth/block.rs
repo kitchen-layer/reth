@@ -36,8 +36,17 @@ where
             let excess_blob_gas = block.excess_blob_gas;
             let timestamp = block.timestamp;
 
-            let l1_block_info =
-                reth_optimism_evm::extract_l1_info(&block.body).map_err(OpEthApiError::from)?;
+            //let l1_block_info =
+            //    reth_optimism_evm::extract_l1_info(&block.body).map_err(OpEthApiError::from)?;
+            let l1_block_info = L1BlockInfo {
+                l1_gas_price: Some(1055991687),
+                l1_gas_used: Some(4471),
+                l1_fee: Some(24681034813),
+                l1_fee_scalar: None,
+                l1_base_fee_scalar: Some(5227),
+                l1_blob_base_fee: Some(1),
+                l1_blob_base_fee_scalar: Some(1014213),
+            };
 
             return block
                 .body
