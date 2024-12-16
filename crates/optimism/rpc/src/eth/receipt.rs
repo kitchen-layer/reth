@@ -38,6 +38,7 @@ where
                 meta.block_hash.into(),
             )))?;
 
+        println!("efzaefze");
         let l1_block_info =
             reth_optimism_evm::extract_l1_info(&block.body).map_err(OpEthApiError::from)?;
 
