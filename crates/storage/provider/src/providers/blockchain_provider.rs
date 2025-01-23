@@ -4,8 +4,8 @@ use crate::{
     AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
     BlockSource, CanonChainTracker, CanonStateNotifications, CanonStateSubscriptions,
     ChainSpecProvider, ChainStateBlockReader, ChangeSetReader, DatabaseProvider,
-    DatabaseProviderFactory, EvmEnvProvider, FullProvider, HeaderProvider, ProviderError,
-    ProviderFactory, PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt,
+    DatabaseProviderFactory, EvmEnvProvider, FullProvider, HashedPostStateProvider, HeaderProvider,
+    ProviderError, ProviderFactory, PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt,
     StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
     StaticFileProviderFactory, TransactionVariant, TransactionsProvider, WithdrawalsProvider,
 };
@@ -23,20 +23,28 @@ use reth_chain_state::{
 use reth_chainspec::{ChainInfo, EthereumHardforks};
 use reth_db::{models::BlockNumberAddress, transaction::DbTx, Database};
 use reth_db_api::models::{AccountBeforeTx, StoredBlockBodyIndices};
-use reth_evm::ConfigureEvmEnv;
+use reth_evm::{env::EvmEnv, ConfigureEvmEnv};
 use reth_execution_types::ExecutionOutcome;
-use reth_node_types::{BlockTy, NodeTypesWithDB, TxTy};
+use reth_node_types::{BlockTy, HeaderTy, NodeTypesWithDB, ReceiptTy, TxTy};
 use reth_primitives::{
     Account, Block, BlockWithSenders, EthPrimitives, NodePrimitives, Receipt, SealedBlock,
     SealedBlockFor, SealedBlockWithSenders, SealedHeader, StorageEntry, TransactionMeta,
-    TransactionSigned, TransactionSignedNoHash,
+    TransactionSigned,
 };
 use reth_primitives_traits::BlockBody as _;
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{DBProvider, NodePrimitivesProvider, StorageChangeSetReader};
+use reth_storage_api::{
+    BlockBodyIndicesProvider, DBProvider, NodePrimitivesProvider, OmmersProvider,
+    StateCommitmentProvider, StorageChangeSetReader,
+};
 use reth_storage_errors::provider::ProviderResult;
-use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
+use reth_trie::HashedPostState;
+use reth_trie_db::StateCommitment;
+use revm::{
+    db::BundleState,
+    primitives::{BlockEnv, CfgEnvWithHandlerCfg},
+};
 use std::{
     ops::{Add, RangeBounds, RangeInclusive, Sub},
     sync::Arc,
@@ -89,7 +97,10 @@ impl<N: ProviderNodeTypes> BlockchainProvider2<N> {
     ///
     /// This returns a `ProviderResult` since it tries the retrieve the last finalized header from
     /// `database`.
-    pub fn with_latest(storage: ProviderFactory<N>, latest: SealedHeader) -> ProviderResult<Self> {
+    pub fn with_latest(
+        storage: ProviderFactory<N>,
+        latest: SealedHeader<HeaderTy<N>>,
+    ) -> ProviderResult<Self> {
         let provider = storage.provider()?;
         let finalized_header = provider
             .last_finalized_block_number()?
@@ -145,7 +156,7 @@ impl<N: ProviderNodeTypes> BlockchainProvider2<N> {
     pub fn get_state(
         &self,
         range: RangeInclusive<BlockNumber>,
-    ) -> ProviderResult<Option<ExecutionOutcome>> {
+    ) -> ProviderResult<Option<ExecutionOutcome<ReceiptTy<N>>>> {
         self.consistent_provider()?.get_state(range)
     }
 }
@@ -168,6 +179,10 @@ impl<N: ProviderNodeTypes> DatabaseProviderFactory for BlockchainProvider2<N> {
     }
 }
 
+impl<N: ProviderNodeTypes> StateCommitmentProvider for BlockchainProvider2<N> {
+    type StateCommitment = N::StateCommitment;
+}
+
 impl<N: ProviderNodeTypes> StaticFileProviderFactory for BlockchainProvider2<N> {
     fn static_file_provider(&self) -> StaticFileProvider<Self::Primitives> {
         self.database.static_file_provider()
@@ -175,11 +190,13 @@ impl<N: ProviderNodeTypes> StaticFileProviderFactory for BlockchainProvider2<N> 
 }
 
 impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider2<N> {
-    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
+    type Header = HeaderTy<N>;
+
+    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Self::Header>> {
         self.consistent_provider()?.header(block_hash)
     }
 
-    fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Header>> {
+    fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
         self.consistent_provider()?.header_by_number(num)
     }
 
@@ -191,26 +208,32 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider2<N> {
         self.consistent_provider()?.header_td_by_number(number)
     }
 
-    fn headers_range(&self, range: impl RangeBounds<BlockNumber>) -> ProviderResult<Vec<Header>> {
+    fn headers_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<Self::Header>> {
         self.consistent_provider()?.headers_range(range)
     }
 
-    fn sealed_header(&self, number: BlockNumber) -> ProviderResult<Option<SealedHeader>> {
+    fn sealed_header(
+        &self,
+        number: BlockNumber,
+    ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
         self.consistent_provider()?.sealed_header(number)
     }
 
     fn sealed_headers_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
-    ) -> ProviderResult<Vec<SealedHeader>> {
+    ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
         self.consistent_provider()?.sealed_headers_range(range)
     }
 
     fn sealed_headers_while(
         &self,
         range: impl RangeBounds<BlockNumber>,
-        predicate: impl FnMut(&SealedHeader) -> bool,
-    ) -> ProviderResult<Vec<SealedHeader>> {
+        predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
+    ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
         self.consistent_provider()?.sealed_headers_while(range, predicate)
     }
 }
@@ -288,19 +311,8 @@ impl<N: ProviderNodeTypes> BlockReader for BlockchainProvider2<N> {
 
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlockFor<Self::Block>, Vec<Receipt>)>> {
+    ) -> ProviderResult<Option<(SealedBlockFor<Self::Block>, Vec<Self::Receipt>)>> {
         Ok(self.canonical_in_memory_state.pending_block_and_receipts())
-    }
-
-    fn ommers(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Header>>> {
-        self.consistent_provider()?.ommers(id)
-    }
-
-    fn block_body_indices(
-        &self,
-        number: BlockNumber,
-    ) -> ProviderResult<Option<StoredBlockBodyIndices>> {
-        self.consistent_provider()?.block_body_indices(number)
     }
 
     /// Returns the block with senders with matching number or hash from database.
@@ -411,28 +423,33 @@ impl<N: ProviderNodeTypes> TransactionsProvider for BlockchainProvider2<N> {
 }
 
 impl<N: ProviderNodeTypes> ReceiptProvider for BlockchainProvider2<N> {
-    fn receipt(&self, id: TxNumber) -> ProviderResult<Option<Receipt>> {
+    type Receipt = ReceiptTy<N>;
+
+    fn receipt(&self, id: TxNumber) -> ProviderResult<Option<Self::Receipt>> {
         self.consistent_provider()?.receipt(id)
     }
 
-    fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Receipt>> {
+    fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
         self.consistent_provider()?.receipt_by_hash(hash)
     }
 
-    fn receipts_by_block(&self, block: BlockHashOrNumber) -> ProviderResult<Option<Vec<Receipt>>> {
+    fn receipts_by_block(
+        &self,
+        block: BlockHashOrNumber,
+    ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
         self.consistent_provider()?.receipts_by_block(block)
     }
 
     fn receipts_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
-    ) -> ProviderResult<Vec<Receipt>> {
+    ) -> ProviderResult<Vec<Self::Receipt>> {
         self.consistent_provider()?.receipts_by_tx_range(range)
     }
 }
 
 impl<N: ProviderNodeTypes> ReceiptProviderIdExt for BlockchainProvider2<N> {
-    fn receipts_by_block_id(&self, block: BlockId) -> ProviderResult<Option<Vec<Receipt>>> {
+    fn receipts_by_block_id(&self, block: BlockId) -> ProviderResult<Option<Vec<Self::Receipt>>> {
         self.consistent_provider()?.receipts_by_block_id(block)
     }
 }
@@ -451,6 +468,21 @@ impl<N: ProviderNodeTypes> WithdrawalsProvider for BlockchainProvider2<N> {
     }
 }
 
+impl<N: ProviderNodeTypes> OmmersProvider for BlockchainProvider2<N> {
+    fn ommers(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Self::Header>>> {
+        self.consistent_provider()?.ommers(id)
+    }
+}
+
+impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for BlockchainProvider2<N> {
+    fn block_body_indices(
+        &self,
+        number: BlockNumber,
+    ) -> ProviderResult<Option<StoredBlockBodyIndices>> {
+        self.consistent_provider()?.block_body_indices(number)
+    }
+}
+
 impl<N: ProviderNodeTypes> StageCheckpointReader for BlockchainProvider2<N> {
     fn get_stage_checkpoint(&self, id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
         self.consistent_provider()?.get_stage_checkpoint(id)
@@ -465,55 +497,16 @@ impl<N: ProviderNodeTypes> StageCheckpointReader for BlockchainProvider2<N> {
     }
 }
 
-impl<N: ProviderNodeTypes> EvmEnvProvider for BlockchainProvider2<N> {
-    fn fill_env_at<EvmConfig>(
+impl<N: ProviderNodeTypes> EvmEnvProvider<HeaderTy<N>> for BlockchainProvider2<N> {
+    fn env_with_header<EvmConfig>(
         &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        block_env: &mut BlockEnv,
-        at: BlockHashOrNumber,
+        header: &HeaderTy<N>,
         evm_config: EvmConfig,
-    ) -> ProviderResult<()>
+    ) -> ProviderResult<EvmEnv>
     where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
+        EvmConfig: ConfigureEvmEnv<Header = HeaderTy<N>>,
     {
-        self.consistent_provider()?.fill_env_at(cfg, block_env, at, evm_config)
-    }
-
-    fn fill_env_with_header<EvmConfig>(
-        &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        block_env: &mut BlockEnv,
-        header: &Header,
-        evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        self.consistent_provider()?.fill_env_with_header(cfg, block_env, header, evm_config)
-    }
-
-    fn fill_cfg_env_at<EvmConfig>(
-        &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        at: BlockHashOrNumber,
-        evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        self.consistent_provider()?.fill_cfg_env_at(cfg, at, evm_config)
-    }
-
-    fn fill_cfg_env_with_header<EvmConfig>(
-        &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        header: &Header,
-        evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        self.consistent_provider()?.fill_cfg_env_with_header(cfg, header, evm_config)
+        self.consistent_provider()?.env_with_header(header, evm_config)
     }
 }
 
@@ -647,10 +640,17 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider2<N> {
     }
 }
 
-impl<N: ProviderNodeTypes> CanonChainTracker for BlockchainProvider2<N>
-where
-    Self: BlockReader,
-{
+impl<N: NodeTypesWithDB> HashedPostStateProvider for BlockchainProvider2<N> {
+    fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
+        HashedPostState::from_bundle_state::<<N::StateCommitment as StateCommitment>::KeyHasher>(
+            bundle_state.state(),
+        )
+    }
+}
+
+impl<N: ProviderNodeTypes> CanonChainTracker for BlockchainProvider2<N> {
+    type Header = HeaderTy<N>;
+
     fn on_forkchoice_update_received(&self, _update: &ForkchoiceState) {
         // update timestamp
         self.canonical_in_memory_state.on_forkchoice_update_received();
@@ -668,15 +668,15 @@ where
         self.canonical_in_memory_state.last_exchanged_transition_configuration_timestamp()
     }
 
-    fn set_canonical_head(&self, header: SealedHeader) {
+    fn set_canonical_head(&self, header: SealedHeader<Self::Header>) {
         self.canonical_in_memory_state.set_canonical_head(header);
     }
 
-    fn set_safe(&self, header: SealedHeader) {
+    fn set_safe(&self, header: SealedHeader<Self::Header>) {
         self.canonical_in_memory_state.set_safe(header);
     }
 
-    fn set_finalized(&self, header: SealedHeader) {
+    fn set_finalized(&self, header: SealedHeader<Self::Header>) {
         self.canonical_in_memory_state.set_finalized(header);
     }
 }
@@ -689,26 +689,32 @@ where
         self.consistent_provider()?.block_by_id(id)
     }
 
-    fn header_by_number_or_tag(&self, id: BlockNumberOrTag) -> ProviderResult<Option<Header>> {
+    fn header_by_number_or_tag(
+        &self,
+        id: BlockNumberOrTag,
+    ) -> ProviderResult<Option<Self::Header>> {
         self.consistent_provider()?.header_by_number_or_tag(id)
     }
 
     fn sealed_header_by_number_or_tag(
         &self,
         id: BlockNumberOrTag,
-    ) -> ProviderResult<Option<SealedHeader>> {
+    ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
         self.consistent_provider()?.sealed_header_by_number_or_tag(id)
     }
 
-    fn sealed_header_by_id(&self, id: BlockId) -> ProviderResult<Option<SealedHeader>> {
+    fn sealed_header_by_id(
+        &self,
+        id: BlockId,
+    ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
         self.consistent_provider()?.sealed_header_by_id(id)
     }
 
-    fn header_by_id(&self, id: BlockId) -> ProviderResult<Option<Header>> {
+    fn header_by_id(&self, id: BlockId) -> ProviderResult<Option<Self::Header>> {
         self.consistent_provider()?.header_by_id(id)
     }
 
-    fn ommers_by_id(&self, id: BlockId) -> ProviderResult<Option<Vec<Header>>> {
+    fn ommers_by_id(&self, id: BlockId) -> ProviderResult<Option<Vec<Self::Header>>> {
         self.consistent_provider()?.ommers_by_id(id)
     }
 }
@@ -722,12 +728,14 @@ impl<N: NodeTypesWithDB<Primitives = EthPrimitives>> CanonStateSubscriptions
 }
 
 impl<N: ProviderNodeTypes> ForkChoiceSubscriptions for BlockchainProvider2<N> {
-    fn subscribe_safe_block(&self) -> ForkChoiceNotifications {
+    type Header = HeaderTy<N>;
+
+    fn subscribe_safe_block(&self) -> ForkChoiceNotifications<Self::Header> {
         let receiver = self.canonical_in_memory_state.subscribe_safe_block();
         ForkChoiceNotifications(receiver)
     }
 
-    fn subscribe_finalized_block(&self) -> ForkChoiceNotifications {
+    fn subscribe_finalized_block(&self) -> ForkChoiceNotifications<Self::Header> {
         let receiver = self.canonical_in_memory_state.subscribe_finalized_block();
         ForkChoiceNotifications(receiver)
     }
@@ -759,6 +767,8 @@ impl<N: ProviderNodeTypes> AccountReader for BlockchainProvider2<N> {
 }
 
 impl<N: ProviderNodeTypes> StateReader for BlockchainProvider2<N> {
+    type Receipt = ReceiptTy<N>;
+
     /// Re-constructs the [`ExecutionOutcome`] from in-memory and database state, if necessary.
     ///
     /// If data for the block does not exist, this will return [`None`].
@@ -768,7 +778,10 @@ impl<N: ProviderNodeTypes> StateReader for BlockchainProvider2<N> {
     /// inconsistent. Currently this can safely be called within the blockchain tree thread,
     /// because the tree thread is responsible for modifying the [`CanonicalInMemoryState`] in the
     /// first place.
-    fn get_state(&self, block: BlockNumber) -> ProviderResult<Option<ExecutionOutcome>> {
+    fn get_state(
+        &self,
+        block: BlockNumber,
+    ) -> ProviderResult<Option<ExecutionOutcome<Self::Receipt>>> {
         StateReader::get_state(&self.consistent_provider()?, block)
     }
 }
@@ -803,15 +816,13 @@ mod tests {
     use reth_db_api::{cursor::DbCursorRO, transaction::DbTx};
     use reth_errors::ProviderError;
     use reth_execution_types::{Chain, ExecutionOutcome};
-    use reth_primitives::{
-        BlockExt, Receipt, SealedBlock, StaticFileSegment, TransactionSignedNoHash,
-    };
+    use reth_primitives::{BlockExt, Receipt, SealedBlock, StaticFileSegment};
     use reth_primitives_traits::{BlockBody as _, SignedTransaction};
     use reth_storage_api::{
-        BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt, BlockSource,
-        ChangeSetReader, DatabaseProviderFactory, HeaderProvider, ReceiptProvider,
-        ReceiptProviderIdExt, StateProviderFactory, TransactionVariant, TransactionsProvider,
-        WithdrawalsProvider,
+        BlockBodyIndicesProvider, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader,
+        BlockReaderIdExt, BlockSource, ChangeSetReader, DatabaseProviderFactory, HeaderProvider,
+        OmmersProvider, ReceiptProvider, ReceiptProviderIdExt, StateProviderFactory,
+        TransactionVariant, TransactionsProvider, WithdrawalsProvider,
     };
     use reth_testing_utils::generators::{
         self, random_block, random_block_range, random_changeset_range, random_eoa_accounts,
@@ -1009,7 +1020,7 @@ mod tests {
                     // Push to disk
                     let provider_rw = hook_provider.database_provider_rw().unwrap();
                     UnifiedStorageWriter::from(&provider_rw, &hook_provider.static_file_provider())
-                        .save_blocks(&[lowest_memory_block])
+                        .save_blocks(vec![lowest_memory_block])
                         .unwrap();
                     UnifiedStorageWriter::commit(provider_rw).unwrap();
 
@@ -1524,7 +1535,7 @@ mod tests {
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
 
         let block_number = database_block.number;
-        let block_hash = database_block.header.hash();
+        let block_hash = database_block.hash();
 
         assert_eq!(
             provider.block_by_id(block_number.into()).unwrap(),
@@ -1533,7 +1544,7 @@ mod tests {
         assert_eq!(provider.block_by_id(block_hash.into()).unwrap(), Some(database_block.unseal()));
 
         let block_number = in_memory_block.number;
-        let block_hash = in_memory_block.header.hash();
+        let block_hash = in_memory_block.hash();
         assert_eq!(
             provider.block_by_id(block_number.into()).unwrap(),
             Some(in_memory_block.clone().unseal())
@@ -1617,7 +1628,7 @@ mod tests {
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
 
         let block_number = database_block.number;
-        let block_hash = database_block.header.hash();
+        let block_hash = database_block.hash();
 
         assert_eq!(
             provider.header_by_id(block_number.into()).unwrap(),
@@ -1638,7 +1649,7 @@ mod tests {
         );
 
         let block_number = in_memory_block.number;
-        let block_hash = in_memory_block.header.hash();
+        let block_hash = in_memory_block.hash();
 
         assert_eq!(
             provider.header_by_id(block_number.into()).unwrap(),
@@ -1675,7 +1686,7 @@ mod tests {
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
 
         let block_number = database_block.number;
-        let block_hash = database_block.header.hash();
+        let block_hash = database_block.hash();
 
         assert_eq!(
             provider.ommers_by_id(block_number.into()).unwrap().unwrap_or_default(),
@@ -1687,7 +1698,7 @@ mod tests {
         );
 
         let block_number = in_memory_block.number;
-        let block_hash = in_memory_block.header.hash();
+        let block_hash = in_memory_block.hash();
 
         assert_eq!(
             provider.ommers_by_id(block_number.into()).unwrap().unwrap_or_default(),
@@ -1715,7 +1726,7 @@ mod tests {
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
 
         let block_number = database_block.number;
-        let block_hash = database_block.header.hash();
+        let block_hash = database_block.hash();
 
         assert!(!receipts.get(database_block.number as usize).unwrap().is_empty());
         assert!(!provider
@@ -1733,7 +1744,7 @@ mod tests {
         );
 
         let block_number = in_memory_block.number;
-        let block_hash = in_memory_block.header.hash();
+        let block_hash = in_memory_block.hash();
 
         assert_eq!(
             provider.receipts_by_block_id(block_number.into())?.unwrap(),
@@ -2566,7 +2577,7 @@ mod tests {
                             .unseal::<reth_primitives::Block>()
                             .with_recovered_senders()
                             .unwrap()
-                            .seal(block.hash())
+                            .seal_unchecked(block.hash())
                     )
                 ),
                 (BlockHashOrNumber::Number(u64::MAX), TransactionVariant::WithHash)
@@ -2582,7 +2593,7 @@ mod tests {
                             .unseal::<reth_primitives::Block>()
                             .with_recovered_senders()
                             .unwrap()
-                            .seal(block.hash())
+                            .seal_unchecked(block.hash())
                     )
                 ),
                 (BlockHashOrNumber::Hash(B256::random()), TransactionVariant::WithHash)
